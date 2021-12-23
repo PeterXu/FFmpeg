@@ -19,8 +19,12 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#ifndef CONFIG_ION
 #include <drm_fourcc.h>
+#endif
+
 #include <pthread.h>
+#include <rga/RgaApi.h>
 #include <rockchip/mpp_buffer.h>
 #include <rockchip/rk_mpi.h>
 #include <time.h>
@@ -41,6 +45,8 @@
 #define RECEIVE_FRAME_TIMEOUT   100
 #define FRAMEGROUP_MAX_FRAMES   16
 #define INPUT_MAX_PACKETS       4
+
+static int rga_supported = -1;
 
 typedef struct {
     MppCtx ctx;
@@ -64,6 +70,105 @@ typedef struct {
     AVBufferRef *decoder_ref;
 } RKMPPFrameContext;
 
+static int get_rga_format(int av_fmt) {
+    switch (av_fmt) {
+        case AV_PIX_FMT_NV12:
+            return RK_FORMAT_YCbCr_420_SP;
+        case AV_PIX_FMT_YUV420P:
+            return RK_FORMAT_YCbCr_420_P;
+        default:
+            return -1;
+    }
+}
+
+// only pixel conversion, keep width/height
+static int rkmpp_write_nv12(MppBuffer mpp_buffer, int mpp_vir_width,
+                            int mpp_vir_height, AVFrame* dst_frame) {
+    rga_info_t src_info = {0};
+    rga_info_t dst_info = {0};
+    int width = dst_frame->width - (dst_frame->crop_right + dst_frame->crop_left);
+    int height = dst_frame->height - (dst_frame->crop_bottom + dst_frame->crop_top);
+    int possible_height;
+    int rga_format = get_rga_format(dst_frame->format);
+
+    if (rga_format < 0)
+        return AVERROR(EINVAL);
+
+    if (rga_supported <= 0)
+        goto bail;
+
+    possible_height =
+        (dst_frame->data[1] - dst_frame->data[0]) / dst_frame->linesize[0];
+
+    if (dst_frame->format == AV_PIX_FMT_YUV420P &&
+        (dst_frame->linesize[0] != 2 * dst_frame->linesize[1] ||
+         dst_frame->linesize[1] != dst_frame->linesize[2] ||
+         dst_frame->data[1] - dst_frame->data[0] !=
+         4 * (dst_frame->data[2] - dst_frame->data[1]))) {
+        av_log(NULL, AV_LOG_DEBUG, "dst frame memory is not continuous for planes, fall down to soft copy\n");
+        goto bail; // mostly is not continuous memory
+    }
+
+    src_info.fd = mpp_buffer_get_fd(mpp_buffer);
+#ifndef CONFIG_ION
+    src_info.mmuFlag = 1;
+#endif
+    // mpp decoder always return nv12(yuv420sp)
+    rga_set_rect(&src_info.rect, 0, 0, width, height,
+                 mpp_vir_width, mpp_vir_height, RK_FORMAT_YCbCr_420_SP);
+
+    dst_info.fd = -1;
+    // dst_frame data[*] must be continuous
+    dst_info.virAddr = dst_frame->data[0];
+#ifndef CONFIG_ION
+    dst_info.mmuFlag = 1;
+#endif
+    rga_set_rect(&dst_info.rect, dst_frame->crop_left, dst_frame->crop_top,
+                 width, height, dst_frame->linesize[0], possible_height,
+                 rga_format);
+    if (c_RkRgaBlit(&src_info, &dst_info, NULL) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Failed to do rga blit\n");
+        goto bail;
+    }
+    return 0;
+
+bail:
+    do {
+        int i;
+        uint8_t* src_ptr = (uint8_t*) mpp_buffer_get_ptr(mpp_buffer);
+        for (i = 0; i < height; i++)
+            memcpy(dst_frame->data[0] + dst_frame->linesize[0] * i,
+                   src_ptr + mpp_vir_width * i, width);
+        src_ptr += mpp_vir_width * mpp_vir_height;
+        switch (dst_frame->format) {
+        case AV_PIX_FMT_NV12:
+            for (i = 0; i < height / 2; i++)
+                memcpy(dst_frame->data[1] + dst_frame->linesize[1] * i,
+                   src_ptr + mpp_vir_width * i, width);
+            return 0;
+        case AV_PIX_FMT_YUV420P: {
+            int j;
+            uint8_t* dst_u = dst_frame->data[1];
+            uint8_t* dst_v = dst_frame->data[2];
+            for (i = 0; i < height / 2; i++) {
+                for (j = 0; j < width; j++) {
+                    dst_u[j] = src_ptr[2 * j + 0];
+                    dst_v[j] = src_ptr[2 * j + 1];
+                }
+                dst_u += dst_frame->linesize[1];
+                dst_v += dst_frame->linesize[2];
+                src_ptr += mpp_vir_width;
+            }
+            return 0;
+        }
+        default:
+            break;
+        }
+    } while(0);
+
+    return AVERROR(EINVAL);
+}
+
 static MppCodingType rkmpp_get_codingtype(AVCodecContext *avctx)
 {
     switch (avctx->codec_id) {
@@ -78,7 +183,9 @@ static MppCodingType rkmpp_get_codingtype(AVCodecContext *avctx)
 static uint32_t rkmpp_get_frameformat(MppFrameFormat mppformat)
 {
     switch (mppformat) {
+#ifndef CONFIG_ION
     case MPP_FMT_YUV420SP:          return DRM_FORMAT_NV12;
+#endif
 #ifdef DRM_FORMAT_NV12_10
     case MPP_FMT_YUV420SP_10BIT:    return DRM_FORMAT_NV12_10;
 #endif
@@ -99,6 +206,9 @@ static int rkmpp_write_data(AVCodecContext *avctx, uint8_t *buffer, int size, in
         av_log(avctx, AV_LOG_ERROR, "Failed to init MPP packet (code = %d)\n", ret);
         return AVERROR_UNKNOWN;
     }
+
+    if (pts == AV_NOPTS_VALUE || !pts)
+        pts = avctx->reordered_opaque;
 
     mpp_packet_set_pts(packet, pts);
 
@@ -158,7 +268,20 @@ static int rkmpp_init_decoder(AVCodecContext *avctx)
     RK_S64 paramS64;
     RK_S32 paramS32;
 
-    avctx->pix_fmt = AV_PIX_FMT_DRM_PRIME;
+#ifdef CONFIG_ION
+    avctx->pix_fmt = AV_PIX_FMT_NONE;
+#endif
+
+    if (avctx->pix_fmt == AV_PIX_FMT_NONE &&
+        avctx->sw_pix_fmt == AV_PIX_FMT_NONE) {
+        // chromium only support AV_PIX_FMT_YUV420P
+        avctx->pix_fmt = avctx->sw_pix_fmt = AV_PIX_FMT_YUV420P;
+    } else {
+        if (avctx->pix_fmt == AV_PIX_FMT_NONE)
+            avctx->pix_fmt = AV_PIX_FMT_DRM_PRIME;
+        avctx->sw_pix_fmt = (avctx->pix_fmt == AV_PIX_FMT_DRM_PRIME) ?
+                            AV_PIX_FMT_NV12 : avctx->pix_fmt;
+    }
 
     // create a decoder and a ref to it
     decoder = av_mallocz(sizeof(RKMPPDecoder));
@@ -258,6 +381,15 @@ static int rkmpp_init_decoder(AVCodecContext *avctx)
     if (ret < 0)
         goto fail;
 
+    if (rga_supported < 0)
+        rga_supported = c_RkRgaInit() ? 0 : 1;
+    if (!rga_supported) {
+        if (access("/dev/rga", R_OK) != 0)
+            av_log(avctx, AV_LOG_ERROR, "Fail to access rga: %s\n",
+                   strerror(errno));
+        av_log(avctx, AV_LOG_ERROR, "No rga support\n");
+    }
+
     return 0;
 
 fail:
@@ -317,6 +449,71 @@ static void rkmpp_release_frame(void *opaque, uint8_t *data)
     av_free(desc);
 }
 
+static void rkmpp_setinfo_avframe(AVFrame *frame, MppFrame mppframe) {
+    int mode;
+
+    frame->pts              = mpp_frame_get_pts(mppframe);
+#if FF_API_PKT_PTS
+    FF_DISABLE_DEPRECATION_WARNINGS
+    frame->pkt_pts          = frame->pts;
+    FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+    frame->reordered_opaque = frame->pts;
+    frame->color_range      = mpp_frame_get_color_range(mppframe);
+    frame->color_primaries  = mpp_frame_get_color_primaries(mppframe);
+    frame->color_trc        = mpp_frame_get_color_trc(mppframe);
+    frame->colorspace       = mpp_frame_get_colorspace(mppframe);
+
+    mode = mpp_frame_get_mode(mppframe);
+    frame->interlaced_frame = ((mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_DEINTERLACED);
+    frame->top_field_first  = ((mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_TOP_FIRST);
+}
+
+static int rkmpp_get_continue_video_buffer(AVFrame *frame) {
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
+    int ret, i, padded_height;
+
+    if (!desc)
+        return AVERROR(EINVAL);
+
+    if ((ret = av_image_check_size(frame->width, frame->height, 0, NULL)) < 0)
+        return ret;
+
+    if (!frame->linesize[0]) {
+        for(i=1; i<=16; i+=i) {
+            ret = av_image_fill_linesizes(frame->linesize, frame->format,
+                                          FFALIGN(frame->width, i));
+            if (ret < 0)
+                return ret;
+            // rga need 16 align
+            if (!(frame->linesize[0] & (16-1)))
+                break;
+        }
+    }
+
+    padded_height = frame->height;
+    if ((ret = av_image_fill_pointers(frame->data, frame->format, padded_height,
+                                      NULL, frame->linesize)) < 0)
+        return ret;
+
+    frame->buf[0] = av_buffer_alloc(ret + 4 * 16);
+    if (!frame->buf[0]) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    if ((ret = av_image_fill_pointers(frame->data, frame->format, padded_height,
+                                      frame->buf[0]->data, frame->linesize)) < 0)
+        goto fail;
+
+    frame->extended_data = frame->data;
+
+    return 0;
+fail:
+    av_frame_unref(frame);
+    return ret;
+}
+
 static int rkmpp_retrieve_frame(AVCodecContext *avctx, AVFrame *frame)
 {
     RKMPPDecodeContext *rk_context = avctx->priv_data;
@@ -328,7 +525,6 @@ static int rkmpp_retrieve_frame(AVCodecContext *avctx, AVFrame *frame)
     MppBuffer buffer = NULL;
     AVDRMFrameDescriptor *desc = NULL;
     AVDRMLayerDescriptor *layer = NULL;
-    int mode;
     MppFrameFormat mppformat;
     uint32_t drmformat;
 
@@ -349,6 +545,9 @@ static int rkmpp_retrieve_frame(AVCodecContext *avctx, AVFrame *frame)
 
             avctx->width = mpp_frame_get_width(mppframe);
             avctx->height = mpp_frame_get_height(mppframe);
+            // chromium will align u/v width height to 32
+            avctx->coded_width = FFALIGN(avctx->width, 64);
+            avctx->coded_height = FFALIGN(avctx->height, 64);
 
             decoder->mpi->control(decoder->ctx, MPP_DEC_SET_INFO_CHANGE_READY, NULL);
 
@@ -365,7 +564,11 @@ static int rkmpp_retrieve_frame(AVCodecContext *avctx, AVFrame *frame)
 
             hwframes = (AVHWFramesContext*)decoder->frames_ref->data;
             hwframes->format    = AV_PIX_FMT_DRM_PRIME;
-            hwframes->sw_format = drmformat == DRM_FORMAT_NV12 ? AV_PIX_FMT_NV12 : AV_PIX_FMT_NONE;
+#ifndef CONFIG_ION
+            hwframes->sw_format = av_drm_get_pixfmt(drmformat);
+#else
+            hwframes->sw_format = AV_PIX_FMT_NONE;
+#endif
             hwframes->width     = avctx->width;
             hwframes->height    = avctx->height;
             ret = av_hwframe_ctx_init(decoder->frames_ref);
@@ -394,18 +597,13 @@ static int rkmpp_retrieve_frame(AVCodecContext *avctx, AVFrame *frame)
         av_log(avctx, AV_LOG_DEBUG, "Received a frame.\n");
 
         // setup general frame fields
-        frame->format           = AV_PIX_FMT_DRM_PRIME;
-        frame->width            = mpp_frame_get_width(mppframe);
-        frame->height           = mpp_frame_get_height(mppframe);
-        frame->pts              = mpp_frame_get_pts(mppframe);
-        frame->color_range      = mpp_frame_get_color_range(mppframe);
-        frame->color_primaries  = mpp_frame_get_color_primaries(mppframe);
-        frame->color_trc        = mpp_frame_get_color_trc(mppframe);
-        frame->colorspace       = mpp_frame_get_colorspace(mppframe);
-
-        mode = mpp_frame_get_mode(mppframe);
-        frame->interlaced_frame = ((mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_DEINTERLACED);
-        frame->top_field_first  = ((mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_TOP_FIRST);
+        frame->format           = avctx->pix_fmt;
+        frame->width            = avctx->coded_width;
+        frame->height           = avctx->coded_height;
+        frame->crop_left        = 0;
+        frame->crop_right       = avctx->coded_width - mpp_frame_get_width(mppframe);
+        frame->crop_top         = 0;
+        frame->crop_bottom      = avctx->coded_height - mpp_frame_get_height(mppframe);
 
         mppformat = mpp_frame_get_fmt(mppframe);
         drmformat = rkmpp_get_frameformat(mppformat);
@@ -413,6 +611,25 @@ static int rkmpp_retrieve_frame(AVCodecContext *avctx, AVFrame *frame)
         // now setup the frame buffer info
         buffer = mpp_frame_get_buffer(mppframe);
         if (buffer) {
+            if (avctx->pix_fmt != AV_PIX_FMT_DRM_PRIME) {
+                if (avctx->get_buffer2 == avcodec_default_get_buffer2) {
+                    // firefox path
+                    ret = rkmpp_get_continue_video_buffer(frame);
+                } else {
+                    ret = ff_get_buffer(avctx, frame, 0);
+                }
+                if (ret) {
+                    av_log(avctx, AV_LOG_ERROR, "Fail to alloc frame.\n");
+                    goto fail;
+                }
+                rkmpp_setinfo_avframe(frame, mppframe);
+                // Do pixel conversion, TODO: implement rga AVFilter
+                ret = rkmpp_write_nv12(buffer,
+                    mpp_frame_get_hor_stride(mppframe),
+                    mpp_frame_get_ver_stride(mppframe), frame);
+                goto fail; // alway release mpp resource
+            }
+            rkmpp_setinfo_avframe(frame, mppframe);
             desc = av_mallocz(sizeof(AVDRMFrameDescriptor));
             if (!desc) {
                 ret = AVERROR(ENOMEM);
@@ -421,6 +638,7 @@ static int rkmpp_retrieve_frame(AVCodecContext *avctx, AVFrame *frame)
 
             desc->nb_objects = 1;
             desc->objects[0].fd = mpp_buffer_get_fd(buffer);
+            desc->objects[0].ptr = mpp_buffer_get_ptr(buffer);
             desc->objects[0].size = mpp_buffer_get_size(buffer);
 
             desc->nb_layers = 1;
@@ -473,6 +691,8 @@ static int rkmpp_retrieve_frame(AVCodecContext *avctx, AVFrame *frame)
         return AVERROR_EOF;
     } else if (ret == MPP_ERR_TIMEOUT) {
         av_log(avctx, AV_LOG_DEBUG, "Timeout when trying to get a frame from MPP\n");
+    } else {
+        av_log(avctx, AV_LOG_DEBUG, "MPP decode_get_frame ret = %d\n", ret);
     }
 
     return AVERROR(EAGAIN);
@@ -524,10 +744,6 @@ static int rkmpp_receive_frame(AVCodecContext *avctx, AVFrame *frame)
                 return ret;
             }
         }
-
-        // make sure we keep decoder full
-        if (freeslots > 1)
-            return AVERROR(EAGAIN);
     }
 
     return rkmpp_retrieve_frame(avctx, frame);
@@ -544,12 +760,15 @@ static void rkmpp_flush(AVCodecContext *avctx)
     ret = decoder->mpi->reset(decoder->ctx);
     if (ret == MPP_OK) {
         decoder->first_packet = 1;
+        decoder->eos_reached = 0;
     } else
         av_log(avctx, AV_LOG_ERROR, "Failed to reset MPI (code = %d)\n", ret);
 }
 
 static const AVCodecHWConfigInternal *rkmpp_hw_configs[] = {
     HW_CONFIG_INTERNAL(DRM_PRIME),
+    HW_CONFIG_INTERNAL(NV12),
+    HW_CONFIG_INTERNAL(YUV420P),
     NULL
 };
 
@@ -574,6 +793,8 @@ static const AVCodecHWConfigInternal *rkmpp_hw_configs[] = {
         .priv_class     = &rkmpp_##NAME##_dec_class, \
         .capabilities   = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_AVOID_PROBING | AV_CODEC_CAP_HARDWARE, \
         .pix_fmts       = (const enum AVPixelFormat[]) { AV_PIX_FMT_DRM_PRIME, \
+                                                         AV_PIX_FMT_NV12, \
+                                                         AV_PIX_FMT_YUV420P, \
                                                          AV_PIX_FMT_NONE}, \
         .hw_configs     = rkmpp_hw_configs, \
         .bsfs           = BSFS, \

@@ -141,6 +141,7 @@ extern AVCodec ff_h264_mediacodec_decoder;
 extern AVCodec ff_h264_mmal_decoder;
 extern AVCodec ff_h264_qsv_decoder;
 extern AVCodec ff_h264_rkmpp_decoder;
+extern AVCodec ff_h264_rkmpp_encoder;
 extern AVCodec ff_hap_encoder;
 extern AVCodec ff_hap_decoder;
 extern AVCodec ff_hevc_decoder;
@@ -853,7 +854,7 @@ static enum AVCodecID remap_deprecated_codec_id(enum AVCodecID id)
 
 static AVCodec *find_codec(enum AVCodecID id, int (*x)(const AVCodec *))
 {
-    const AVCodec *p, *experimental = NULL;
+    const AVCodec *p, *experimental = NULL, *first = NULL;
     void *i = 0;
 
     id = remap_deprecated_codec_id(id);
@@ -864,12 +865,17 @@ static AVCodec *find_codec(enum AVCodecID id, int (*x)(const AVCodec *))
         if (p->id == id) {
             if (p->capabilities & AV_CODEC_CAP_EXPERIMENTAL && !experimental) {
                 experimental = p;
-            } else
-                return (AVCodec*)p;
+            } else {
+                if (!first)
+                    first = p;
+                // prefer hardware
+                if (p->capabilities & AV_CODEC_CAP_HARDWARE)
+                    return (AVCodec*)p;
+            }
         }
     }
 
-    return (AVCodec*)experimental;
+    return first ? (AVCodec*)first : (AVCodec*)experimental;
 }
 
 AVCodec *avcodec_find_encoder(enum AVCodecID id)

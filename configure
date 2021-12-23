@@ -325,6 +325,7 @@ External library support:
   --disable-dxva2          disable Microsoft DirectX 9 video acceleration code [autodetect]
   --disable-ffnvcodec      disable dynamically linked Nvidia code [autodetect]
   --enable-libdrm          enable DRM code (Linux) [no]
+  --enable-libion          enable libion code (Linux) [no]
   --enable-libmfx          enable Intel MediaSDK (AKA Quick Sync Video) code via libmfx [no]
   --enable-libnpp          enable Nvidia Performance Primitives-based code [no]
   --enable-mmal            enable Broadcom Multi-Media Abstraction Layer (Raspberry Pi) via MMAL [no]
@@ -332,6 +333,7 @@ External library support:
   --disable-nvenc          disable Nvidia video encoding code [autodetect]
   --enable-omx             enable OpenMAX IL code [no]
   --enable-omx-rpi         enable OpenMAX IL code for Raspberry Pi [no]
+  --enable-librga          enable Rockchip rga external library [no]
   --enable-rkmpp           enable Rockchip Media Process Platform code [no]
   --disable-v4l2-m2m       disable V4L2 mem2mem code [autodetect]
   --disable-vaapi          disable Video Acceleration API (mainly Unix/Intel) code [autodetect]
@@ -1688,6 +1690,7 @@ EXTERNAL_LIBRARY_VERSION3_LIST="
     libvmaf
     libvo_amrwbenc
     mbedtls
+    librga
     rkmpp
 "
 
@@ -1714,6 +1717,7 @@ EXTERNAL_LIBRARY_LIST="
     libcodec2
     libdc1394
     libdrm
+    libion
     libflite
     libfontconfig
     libfreetype
@@ -2929,6 +2933,7 @@ qsvenc_select="qsv"
 qsvvpp_select="qsv"
 vaapi_encode_deps="vaapi"
 v4l2_m2m_deps="linux_videodev2_h sem_timedwait"
+rkmpp_deps="librga"
 
 hwupload_cuda_filter_deps="ffnvcodec"
 scale_npp_filter_deps="ffnvcodec libnpp"
@@ -2956,6 +2961,7 @@ h264_qsv_decoder_select="h264_mp4toannexb_bsf h264_parser qsvdec"
 h264_qsv_encoder_select="qsvenc"
 h264_rkmpp_decoder_deps="rkmpp"
 h264_rkmpp_decoder_select="h264_mp4toannexb_bsf"
+h264_rkmpp_encoder_deps="rkmpp"
 h264_vaapi_encoder_select="cbs_h264 vaapi_encode"
 h264_v4l2m2m_decoder_deps="v4l2_m2m h264_v4l2_m2m"
 h264_v4l2m2m_decoder_select="h264_mp4toannexb_bsf"
@@ -6072,6 +6078,8 @@ enabled libcodec2         && require libcodec2 codec2/codec2.h codec2_create -lc
 enabled libdavs2          && require_pkg_config libdavs2 "davs2 >= 1.5.115" davs2.h davs2_decoder_open
 enabled libdc1394         && require_pkg_config libdc1394 libdc1394-2 dc1394/dc1394.h dc1394_new
 enabled libdrm            && require_pkg_config libdrm libdrm xf86drm.h drmGetVersion
+enabled libion            && require_pkg_config libion libion ion.h ion_open
+
 enabled libfdk_aac        && { check_pkg_config libfdk_aac fdk-aac "fdk-aac/aacenc_lib.h" aacEncOpen ||
                                { require libfdk_aac fdk-aac/aacenc_lib.h aacEncOpen -lfdk-aac &&
                                  warn "using libfdk without pkg-config"; } }
@@ -6233,10 +6241,13 @@ enabled openssl           && { check_pkg_config openssl openssl openssl/ssl.h OP
                                check_lib openssl openssl/ssl.h SSL_library_init -lssl32 -leay32 ||
                                check_lib openssl openssl/ssl.h SSL_library_init -lssl -lcrypto -lws2_32 -lgdi32 ||
                                die "ERROR: openssl not found"; }
+enabled librga            && require librga "rga/RgaApi.h" c_RkRgaInit -lrga
 enabled rkmpp             && { require_pkg_config rkmpp rockchip_mpp  rockchip/rk_mpi.h mpp_create &&
                                require_pkg_config rockchip_mpp "rockchip_mpp >= 1.3.7" rockchip/rk_mpi.h mpp_create &&
-                               { enabled libdrm ||
-                                 die "ERROR: rkmpp requires --enable-libdrm"; }
+                               { enabled libdrm || enabled libion ||
+                                 die "ERROR: rkmpp requires --enable-libdrm or --enable-libion"; } &&
+                               { enabled librga ||
+                                 die "ERROR: rkmpp requires --enable-librga"; }
                              }
 enabled vapoursynth       && require_pkg_config vapoursynth "vapoursynth-script >= 42" VSScript.h vsscript_init
 
