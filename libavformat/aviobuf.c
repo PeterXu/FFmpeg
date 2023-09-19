@@ -368,10 +368,14 @@ int avio_feof(AVIOContext *s)
 {
     if(!s)
         return 0;
+#if CONFIG_IJK
+    ;
+#else
     if(s->eof_reached){
         s->eof_reached=0;
         fill_buffer(s);
     }
+#endif
     return s->eof_reached;
 }
 
@@ -566,6 +570,19 @@ static void fill_buffer(AVIOContext *s)
         len = ctx->orig_buffer_size;
     }
 
+#if CONFIG_IJK
+    len = s->read_packet ? s->read_packet(s->opaque, dst, len) : 0;
+    if (len <= 0) {
+        s->eof_reached = 1;
+        if (len < 0) s->error = len;
+    } else {
+        s->pos += len;
+        s->buf_ptr = dst;
+        s->buf_end = dst + len;
+        ffiocontext(s)->bytes_read += len;
+        s->bytes_read = ffiocontext(s)->bytes_read;
+    }
+#else
     len = read_packet_wrapper(s, dst, len);
     if (len == AVERROR_EOF) {
         /* do not modify buffer if EOF reached so that a seek back can
@@ -581,6 +598,7 @@ static void fill_buffer(AVIOContext *s)
         ffiocontext(s)->bytes_read += len;
         s->bytes_read = ffiocontext(s)->bytes_read;
     }
+#endif
 }
 
 unsigned long ff_crc04C11DB7_update(unsigned long checksum, const uint8_t *buf,
@@ -640,6 +658,24 @@ int avio_read(AVIOContext *s, unsigned char *buf, int size)
         if (len == 0 || s->write_flag) {
             if((s->direct || size > s->buffer_size) && !s->update_checksum && s->read_packet) {
                 // bypass the buffer and read data directly into buf
+#if CONFIG_IJK
+                if (s->read_packet)
+                    len = s->read_packet(s->opaque, buf, size);
+                if (len <= 0) {
+                    s->eof_reached = 1;
+                    if (len < 0) s->error = len;
+                    break;
+                } else {
+                    s->pos += len;
+                    ffiocontext(s)->bytes_read += len;
+                    s->bytes_read = ffiocontext(s)->bytes_read;
+                    size -= len;
+                    buf += len;
+                    // reset the buffer
+                    s->buf_ptr = s->buffer;
+                    s->buf_end = s->buffer/* + len*/;
+                }
+#else
                 len = read_packet_wrapper(s, buf, size);
                 if (len == AVERROR_EOF) {
                     /* do not modify buffer if EOF reached so that a seek back can
@@ -660,6 +696,7 @@ int avio_read(AVIOContext *s, unsigned char *buf, int size)
                     s->buf_ptr = s->buffer;
                     s->buf_end = s->buffer/* + len*/;
                 }
+#endif
             } else {
                 fill_buffer(s);
                 len = s->buf_end - s->buf_ptr;

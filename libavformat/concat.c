@@ -140,6 +140,15 @@ static int concat_read(URLContext *h, unsigned char *buf, int size)
 
     while (size > 0) {
         result = ffurl_read(nodes[i].uc, buf, size);
+#if CONFIG_IJK
+        if (result < 0)
+            return total ? total : result;
+        if (!result) {
+            if (i + 1 == data->length ||
+                ffurl_seek(nodes[++i].uc, 0, SEEK_SET) < 0)
+                break;
+        }
+#else
         if (result == AVERROR_EOF) {
             if (i + 1 == data->length ||
                 ffurl_seek(nodes[++i].uc, 0, SEEK_SET) < 0)
@@ -148,12 +157,17 @@ static int concat_read(URLContext *h, unsigned char *buf, int size)
         }
         if (result < 0)
             return total ? total : result;
+#endif
         total += result;
         buf   += result;
         size  -= result;
     }
     data->current = i;
+#if CONFIG_IJK
+    return total;
+#else
     return total ? total : result;
+#endif
 }
 
 static int64_t concat_seek(URLContext *h, int64_t pos, int whence)

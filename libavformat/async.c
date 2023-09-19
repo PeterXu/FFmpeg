@@ -489,7 +489,8 @@ static const AVClass async_context_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const URLProtocol ff_async_protocol = {
+/* ijk: remove const for memcpy-update */
+/*const*/ URLProtocol ff_async_protocol = {
     .name                = "async",
     .url_open2           = async_open,
     .url_read            = async_read,

@@ -63,7 +63,7 @@ AVDictionaryEntry *av_dict_get(const AVDictionary *m, const char *key,
     const AVDictionaryEntry *entry = prev;
     unsigned int j;
 
-    if (!key)
+    if (!m || !key)
         return NULL;
 
     while ((entry = av_dict_iterate(m, entry))) {
@@ -171,6 +171,55 @@ int av_dict_set_int(AVDictionary **pm, const char *key, int64_t value,
     snprintf(valuestr, sizeof(valuestr), "%"PRId64, value);
     flags &= ~AV_DICT_DONT_STRDUP_VAL;
     return av_dict_set(pm, key, valuestr, flags);
+}
+
+/**
+ * How to process uintptr_t/NULL/%p
+ *  NULL -> 0, %p -> 0x%PRIxPTR or %p -> %#PRIxPTR
+ * uintptr_t:
+ *  An unsigned integer type such that any valid (void *) value
+ *      can be converted to this type and back.
+ *  According to the C language standard,
+ *      it shall be capable of storing values in the range [0, UINTPTR_MAX].
+ */
+
+int av_dict_set_intptr(AVDictionary **pm, const char *key, uintptr_t value,
+                int flags)
+{
+    char valuestr[22] = {0};
+    snprintf(valuestr, sizeof(valuestr), "%#"PRIxPTR, value);
+    flags &= ~AV_DICT_DONT_STRDUP_VAL;
+    return av_dict_set(pm, key, valuestr, flags);
+}
+
+uintptr_t av_dict_get_intptr(const AVDictionary *m, const char *key)
+{
+    AVDictionaryEntry *t = NULL;
+    if ((t = av_dict_get(m, key, NULL, 0))) {
+        return av_dict_strtoptr(t->value);
+    }
+    return 0;
+}
+
+uintptr_t av_dict_strtoptr(char *value)
+{
+   uintptr_t ptr = 0;
+   char *next = NULL;
+   if(!value || value[0] !='0' || (value[1]|0x20)!='x') {
+       return 0;
+   }
+   ptr = strtoull(value, &next, 16);
+   if (next == value) {
+       return 0;
+   }
+   return ptr;
+}
+
+char *av_dict_ptrtostr(uintptr_t value)
+{
+    char valuestr[22] = {0};
+    snprintf(valuestr, sizeof(valuestr), "%#"PRIxPTR, value);
+    return av_strdup(valuestr);
 }
 
 static int parse_key_value_pair(AVDictionary **pm, const char **buf,

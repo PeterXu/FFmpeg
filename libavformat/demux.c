@@ -226,6 +226,7 @@ int avformat_open_input(AVFormatContext **ps, const char *filename,
     AVDictionary *tmp = NULL;
     ID3v2ExtraMeta *id3v2_extra_meta = NULL;
     int ret = 0;
+    AVDictionary *tmp2 = NULL;
 
     if (!s && !(s = avformat_alloc_context()))
         return AVERROR(ENOMEM);
@@ -307,12 +308,31 @@ int avformat_open_input(AVFormatContext **ps, const char *filename,
     if (s->pb)
         ff_id3v2_read_dict(s->pb, &si->id3v2_meta, ID3v2_DEFAULT_MAGIC, &id3v2_extra_meta);
 
+#if CONFIG_IJK
+    if (s->iformat->read_header2) {
+        if (options)
+            av_dict_copy(&tmp2, *options, 0);
+
+        if ((ret = s->iformat->read_header2(s, &tmp2)) < 0) {
+            if (s->iformat->flags_internal & FF_FMT_INIT_CLEANUP)
+                goto close;
+            goto fail;
+        }
+    } else if (s->iformat->read_header) {
+        if ((ret = s->iformat->read_header(s)) < 0) {
+            if (s->iformat->flags_internal & FF_FMT_INIT_CLEANUP)
+                goto close;
+            goto fail;
+        }
+    }
+#else
     if (s->iformat->read_header)
         if ((ret = s->iformat->read_header(s)) < 0) {
             if (s->iformat->flags_internal & FF_FMT_INIT_CLEANUP)
                 goto close;
             goto fail;
         }
+#endif
 
     if (!s->metadata) {
         s->metadata    = si->id3v2_meta;
@@ -349,6 +369,7 @@ int avformat_open_input(AVFormatContext **ps, const char *filename,
     if (options) {
         av_dict_free(options);
         *options = tmp;
+        av_dict_free(&tmp2);
     }
     *ps = s;
     return 0;
@@ -359,6 +380,7 @@ close:
 fail:
     ff_id3v2_free_extra_meta(&id3v2_extra_meta);
     av_dict_free(&tmp);
+    av_dict_free(&tmp2);
     if (s->pb && !(s->flags & AVFMT_FLAG_CUSTOM_IO))
         avio_closep(&s->pb);
     avformat_free_context(s);
@@ -1531,6 +1553,37 @@ return_packet:
     return ret;
 }
 
+#if CONFIG_IJK
+extern int av_try_read_frame(AVFormatContext *s, int *nb_packets, int64_t *ts, int block);
+int av_try_read_frame(AVFormatContext *s, int * nb_packets, int64_t * ts, int block) {
+    int ret = 0;
+    AVPacket pkt1;
+    AVPacket *pkt = &pkt1;
+    FFFormatContext *const si = ffformatcontext(s);
+
+retry:
+    ret = read_frame_internal(s, pkt);
+    if (ret == AVERROR(EAGAIN)) {
+        if (block)
+            goto retry;
+        else
+            return ret;
+    }
+    if (ret < 0)
+        return ret;
+    if (ts != NULL && pkt->dts != AV_NOPTS_VALUE && pkt->stream_index >= 0 && s->nb_streams > 0) {
+        *ts = av_rescale_q(pkt->dts, s->streams[pkt->stream_index]->time_base, AV_TIME_BASE_Q);
+    }
+
+    ret = avpriv_packet_list_put(&si->packet_buffer, pkt, NULL, 0);
+    (*nb_packets)++;
+    av_packet_unref(pkt);
+    if (ret < 0)
+        return ret;
+    return 0;
+}
+#endif
+
 /**
  * Return TRUE if the stream has accurate duration in any stream.
  *
@@ -1646,6 +1699,14 @@ static void update_stream_timings(AVFormatContext *ic)
             ic->bit_rate = bitrate;
     }
 }
+
+#if CONFIG_IJK
+extern void av_update_stream_timings(AVFormatContext *ic);
+void av_update_stream_timings(AVFormatContext *ic)
+{
+    update_stream_timings(ic);
+}
+#endif
 
 static void fill_all_stream_timings(AVFormatContext *ic)
 {
@@ -2422,6 +2483,12 @@ static int add_coded_side_data(AVStream *st, AVCodecContext *avctx)
     return 0;
 }
 
+extern int avformat_add_coded_side_data(AVStream *st, AVCodecContext *avctx);
+int avformat_add_coded_side_data(AVStream *st, AVCodecContext *avctx)
+{
+    return add_coded_side_data(st, avctx);
+}
+
 int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
 {
     FFFormatContext *const si = ffformatcontext(ic);
@@ -2438,6 +2505,67 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
     int64_t probesize = ic->probesize;
     int eof_reached = 0;
     int *missing_streams = av_opt_ptr(ic->iformat->priv_class, ic->priv_data, "missing_streams");
+
+#if CONFIG_IJK
+    AVDictionaryEntry *t;
+
+    t = av_dict_get(ic->metadata, "nb-streams", NULL, AV_DICT_MATCH_CASE);
+    if (t) {
+        int nb_streams = (int) strtol(t->value, NULL, 10);
+        if (nb_streams > 0) {
+            AVPacket *pkt = NULL;
+            int64_t read_size = 0;
+            int found_all_streams = 0;
+            int i = 0;
+            while (!found_all_streams) {
+                if (read_size >= probesize) {
+                    av_log(NULL, AV_LOG_INFO, "probe fail\n");
+                    return ic->nb_streams;
+                }
+
+                ret = read_frame_internal(ic, pkt1);
+                if (ret == AVERROR(EAGAIN))
+                    continue;
+                if (ret < 0) {
+                    /* EOF or error*/
+                    eof_reached = 1;
+                    break;
+                }
+                pkt = pkt1;
+
+                if (!(ic->streams[pkt->stream_index]->disposition & AV_DISPOSITION_ATTACHED_PIC))
+                    read_size += pkt->size;
+
+                if (!(ic->flags & AVFMT_FLAG_NOBUFFER)) {
+                    ret = avpriv_packet_list_put(&si->raw_packet_buffer,
+                                                 pkt, NULL, 0);
+                    if (ret < 0)
+                        return ret;
+                }
+
+                for(i = 0; i < ic->nb_streams; i++) {
+                    int64_t cur_start_time = AV_NOPTS_VALUE;
+                    if (ic->streams[i]->start_time != AV_NOPTS_VALUE) {
+                        cur_start_time = av_rescale_q(ic->streams[i]->start_time,
+                                                        ic->streams[i]->time_base,
+                                                        AV_TIME_BASE_Q);
+                    }
+                    if (cur_start_time != AV_NOPTS_VALUE &&
+                        (ic->start_time == AV_NOPTS_VALUE || ic->start_time > cur_start_time)){
+                       ic->start_time = cur_start_time;
+                    }
+                }
+
+                if (ic->nb_streams >= nb_streams && ic->start_time != AV_NOPTS_VALUE) {
+                    av_log(NULL, AV_LOG_INFO, "probe pass\n");
+                    found_all_streams  = 1;
+                }
+            }
+            av_dict_set_int(&ic->metadata, "nb-streams", 0, 0);
+            return ret < 0 ? ret : ic->nb_streams;
+        }
+    }
+#endif
 
     flush_codecs = probesize > 0;
 
@@ -2540,6 +2668,22 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
 
             if (!has_codec_parameters(st, NULL))
                 break;
+#if CONFIG_IJK
+            if (ic->metadata) {
+                AVDictionaryEntry *t = av_dict_get(ic->metadata, "skip-calc-frame-rate", NULL, AV_DICT_MATCH_CASE);
+                if (t) {
+                    int fps_flag = (int) strtol(t->value, NULL, 10);
+                    if (!st->r_frame_rate.num && st->avg_frame_rate.num > 0 && st->avg_frame_rate.den > 0 && fps_flag > 0) {
+                        int avg_fps = st->avg_frame_rate.num / st->avg_frame_rate.den;
+                        if (avg_fps > 0 && avg_fps <= 120) {
+                            st->r_frame_rate.num = st->avg_frame_rate.num;
+                            st->r_frame_rate.den = st->avg_frame_rate.den;
+                        }
+                    }
+                }
+            }
+#endif
+
             /* If the timebase is coarse (like the usual millisecond precision
              * of mkv), we need to analyze more frames to reliably arrive at
              * the correct fps. */

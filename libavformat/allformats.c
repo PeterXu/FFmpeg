@@ -512,6 +512,16 @@ extern const AVInputFormat  ff_xwma_demuxer;
 extern const AVInputFormat  ff_yop_demuxer;
 extern const AVInputFormat  ff_yuv4mpegpipe_demuxer;
 extern const FFOutputFormat ff_yuv4mpegpipe_muxer;
+
+/* ijk demuxers */
+extern const AVInputFormat  ff_ijklivehook_demuxer;
+extern const AVInputFormat  ff_ijkswitch_demuxer;
+extern const AVInputFormat  ff_ijkdash_demuxer;
+extern const AVInputFormat  ff_ijklivedash_demuxer;
+extern const AVInputFormat  ff_ijkioproxy_demuxer;
+extern const AVInputFormat  ff_ijkofflinehook_demuxer;
+extern const AVInputFormat  ff_ijklas_demuxer;
+
 /* image demuxers */
 extern const AVInputFormat  ff_image_bmp_pipe_demuxer;
 extern const AVInputFormat  ff_image_cri_pipe_demuxer;

@@ -185,11 +185,17 @@ int ff_decode_get_packet(AVCodecContext *avctx, AVPacket *pkt)
     AVCodecInternal *avci = avctx->internal;
     int ret;
 
-    if (avci->draining)
+    int disable_drain_silence = 1;
+#if CONFIG_IJK
+    int drain_silence_enable = (avctx->flags2 & AV_CODEC_FLAG2_DRAIN_SILENCE) == AV_CODEC_FLAG2_DRAIN_SILENCE;
+    disable_drain_silence = (!drain_silence_enable || !avci->drain_silence);
+#endif
+
+    if (avci->draining && disable_drain_silence)
         return AVERROR_EOF;
 
     ret = av_bsf_receive_packet(avci->bsf, pkt);
-    if (ret == AVERROR_EOF)
+    if (ret == AVERROR_EOF && disable_drain_silence)
         avci->draining = 1;
     if (ret < 0)
         return ret;
@@ -246,6 +252,37 @@ static int64_t guess_correct_pts(AVCodecContext *ctx,
     return pts;
 }
 
+#if CONFIG_IJK
+static int fill_silence_frame(AVCodecContext *avctx, AVFrame *frame, int samples, int pts) {
+    int ret = 0;
+    frame->best_effort_timestamp = pts;
+    frame->nb_samples = samples;
+    if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
+        return ret;
+#if FF_API_OLD_CHANNEL_LAYOUT
+FF_DISABLE_DEPRECATION_WARNINGS
+    /* compat wrapper for old-style callers */
+    if (avctx->channel_layout && !avctx->channels)
+        avctx->channels = av_popcount64(avctx->channel_layout);
+    if ((avctx->channels && avctx->ch_layout.nb_channels != avctx->channels) ||
+        (avctx->channel_layout && (avctx->ch_layout.order != AV_CHANNEL_ORDER_NATIVE ||
+                                   avctx->ch_layout.u.mask != avctx->channel_layout))) {
+        av_channel_layout_uninit(&avctx->ch_layout);
+        if (avctx->channel_layout) {
+            av_channel_layout_from_mask(&avctx->ch_layout, avctx->channel_layout);
+        } else {
+            avctx->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+        }
+        avctx->ch_layout.nb_channels = avctx->channels;
+    }
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+    ret = av_samples_set_silence(frame->extended_data, 0, samples,
+                                 avctx->ch_layout.nb_channels, avctx->sample_fmt);
+    return ret;
+}
+#endif
+
 /*
  * The core of the receive_frame_wrapper for the decoders implementing
  * the simple API. Certain decoders might consume partial packets without
@@ -260,12 +297,60 @@ static inline int decode_simple_internal(AVCodecContext *avctx, AVFrame *frame, 
     int got_frame, actual_got_frame;
     int ret;
 
-    if (!pkt->data && !avci->draining) {
+    int need_get_packet = !pkt->data && !avci->draining;
+#if CONFIG_IJK
+    int drain_silence_enable = (avctx->flags2 & AV_CODEC_FLAG2_DRAIN_SILENCE) == AV_CODEC_FLAG2_DRAIN_SILENCE;
+    if (drain_silence_enable) {
+        need_get_packet = !pkt->data && !pkt->side_data_elems && (!avci->draining || (avci->draining_done && avci->drain_silence));
+    }
+#endif
+
+    if (need_get_packet) {
         av_packet_unref(pkt);
         ret = ff_decode_get_packet(avctx, pkt);
         if (ret < 0 && ret != AVERROR_EOF)
             return ret;
     }
+
+#if CONFIG_IJK
+    if (drain_silence_enable && avctx->codec->type == AVMEDIA_TYPE_AUDIO) {
+        int silence = 0;
+        if (avci->drain_silence && avci->draining_done && ret == AVERROR_EOF) {
+            avci->drain_silence = 0;
+            return ret;
+        }
+
+        AVDictionary ** dict = (AVDictionary **)av_packet_get_side_data(pkt, AV_PKT_DATA_DICT, NULL);
+        if (dict && *dict) {
+            AVDictionaryEntry * t = NULL;
+            t = av_dict_get(*dict, "silence", NULL, AV_DICT_MATCH_CASE);
+            if (t) {
+                silence = atoi(t->value);
+            }
+        }
+        if (silence) {
+            if (!avci->drain_silence) {
+                // silence delay
+                avci->drain_silence = silence;
+                avci->drain_silence_pts = guess_correct_pts(avctx, pkt->pts, pkt->dts);
+                avci->draining = 1;
+                if (!(avctx->codec->capabilities & AV_CODEC_CAP_DELAY ||
+                      avctx->active_thread_type & FF_THREAD_FRAME)) {
+                    avci->draining_done = 1;
+                }
+            }
+
+            if (avci->draining_done) {
+                // produce silence packet
+                int64_t pts = guess_correct_pts(avctx, pkt->pts, pkt->dts);
+                av_packet_unref(pkt);
+                fill_silence_frame(avctx, frame, silence, pts);
+                return 0;
+            }
+            av_packet_unref(pkt);
+        }
+    }
+#endif
 
     // Some codecs (at least wma lossless) will crash when feeding drain packets
     // after EOF was signaled.
@@ -450,6 +535,21 @@ FF_ENABLE_DEPRECATION_WARNINGS
         }
     }
 
+#if CONFIG_IJK
+    if (drain_silence_enable && avci->drain_silence) {
+        if (avci->draining_done) {
+            // only one time
+            fill_silence_frame(avctx, frame, avci->drain_silence, avci->drain_silence_pts);
+            got_frame = 1;
+        } else {
+            // retry , not use EAGAIN
+            // ret = AVERROR(EAGAIN);
+            got_frame = 0;
+        }
+        return 0;
+    }
+#endif
+
     if (ret >= pkt->size || ret < 0) {
         av_packet_unref(pkt);
     } else {
@@ -600,14 +700,26 @@ int attribute_align_arg avcodec_send_packet(AVCodecContext *avctx, const AVPacke
     AVCodecInternal *avci = avctx->internal;
     int ret;
 
+#if CONFIG_IJK
+    int drain_silence_enable = (avctx->flags2 & AV_CODEC_FLAG2_DRAIN_SILENCE) == AV_CODEC_FLAG2_DRAIN_SILENCE;
+#endif
+
     if (!avcodec_is_open(avctx) || !av_codec_is_decoder(avctx->codec))
         return AVERROR(EINVAL);
 
+#if CONFIG_IJK
+    if (avctx->internal->draining && (!drain_silence_enable || !avctx->internal->drain_silence))
+        return AVERROR_EOF;
+
+    if (avpkt && !avpkt->size && avpkt->data && (!drain_silence_enable || !avpkt->side_data_elems))
+        return AVERROR(EINVAL);
+#else
     if (avctx->internal->draining)
         return AVERROR_EOF;
 
     if (avpkt && !avpkt->size && avpkt->data)
         return AVERROR(EINVAL);
+#endif
 
     av_packet_unref(avci->buffer_pkt);
     if (avpkt && (avpkt->data || avpkt->side_data_elems)) {

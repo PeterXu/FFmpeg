@@ -394,6 +394,9 @@ void avcodec_flush_buffers(AVCodecContext *avctx)
         av_bsf_flush(avci->bsf);
     }
 
+#if CONFIG_IJK
+    avci->drain_silence = 0;
+#endif
     avci->draining      = 0;
     avci->draining_done = 0;
     avci->nb_draining_errors = 0;

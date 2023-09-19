@@ -260,6 +260,8 @@ typedef struct MOVStreamContext {
         AVEncryptionInfo *default_encrypted_sample;
         MOVEncryptionIndex *encryption_index;
     } cenc;
+
+    int last_pts; // IJK
 } MOVStreamContext;
 
 typedef struct MOVContext {
@@ -327,6 +329,11 @@ typedef struct MOVContext {
         int64_t extent_offset;
     } *avif_info;
     int avif_info_size;
+    // IJK
+    int allow_multi_extradata;
+    int has_extradata;
+    int ignore_sidx_index;
+    int fix_fragment_seek;
 } MOVContext;
 
 int ff_mp4_read_descr_len(AVIOContext *pb);
